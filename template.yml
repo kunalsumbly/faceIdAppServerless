@@ -13,7 +13,23 @@ Parameters:
   Stage:
     Type: String
     Description: The name for a project pipeline stage, such as Staging or Prod, for which resources are provisioned and deployed.
-    Default: ''
+    Default: 'Prod'
+  EmailAddress:
+    Description: Email address used for SNS notification whenever people are found in image/video
+    Type: String
+    Default: risekusu@gmail.com
+  UploadImageBucket:
+    Type: String
+    Description: This bucket is for image upload
+    Default: uploadimagekusu
+  KinesisCollectionId:
+    Type: String
+    Description: Kinesis collection Id
+    Default: faceIdAppCollection02
+  KinesisLambdaCodeBucket:
+    Type: String
+    Description: This bucket is to upload the lambda zip for capturing Kinesis data stream events
+    Default: kinesislambdabucket
 
 Globals:
   Function:
@@ -22,41 +38,255 @@ Globals:
       Enabled: true
       Type: Canary10Percent5Minutes
       Role: !Ref CodeDeployRole
+    Environment:
+      Variables:
+        BUCKETNAME: !Ref UploadImageBucket
+        REKOGNITIONCOLLECTION: !Ref  KinesisCollectionId
+        REKOGNITIONFACEMATCHTHRESHOLD: 95
+        PersonData: !Ref MissingPersonTable
+        SnsTopic: !Ref SNSTopic
 
 Resources:
-  HelloWorld:
-    Type: AWS::Serverless::Function
+   # API Gateway
+  FaceIdAPI:
+    Type: AWS::Serverless::Api
     Properties:
-      FunctionName: !Sub 'awscodestar-${ProjectId}-lambda-HelloWorld'
-      Handler: index.handler
-      Runtime: python3.7
-      Role:
-        Fn::GetAtt:
-        - LambdaExecutionRole
-        - Arn
+      StageName: !Sub '${Stage}'
+      Cors:
+        AllowMethods: "'GET,POST,PUT,PATCH,DELETE,OPTIONS'"
+        AllowHeaders: "'*'"
+        AllowOrigin: "'*'"
+  
+  # Upload Image Serverless API 
+  UploadImageFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: uploadimage
+      Runtime: python3.8
+      Timeout: 60
       Events:
-        GetEvent:
-          Type: Api
-          Properties:
-            Path: /
-            Method: get
         PostEvent:
           Type: Api
           Properties:
-            Path: /
-            Method: post
-  LambdaExecutionRole:
-    Description: Creating service role in IAM for AWS Lambda
+            Path: /upload
+            Method: POST
+            RestApiId:
+              Ref: FaceIdAPI
+      Policies:
+        - Statement:
+          - Sid: AllowRekognitionActions
+            Effect: Allow
+            Action:
+            - rekognition:*
+            Resource: '*'
+          - Sid: AllowS3Actions
+            Effect: Allow
+            Action:
+            - s3:*
+            Resource: '*'
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MissingPersonTable
+
+  # Search Image Serverless API 
+  SearchImageFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: searchimage
+      Runtime: python3.8
+      Timeout: 60
+      Events:
+        PostEvent:
+          Type: Api
+          Properties:
+            Path: /searchimage
+            Method: POST
+            RestApiId:
+              Ref: FaceIdAPI
+      Policies:
+        - Statement:
+          - Sid: AllowRekognitionActions
+            Effect: Allow
+            Action:
+            - rekognition:*
+            Resource: '*'
+          - Sid: AllowS3Actions
+            Effect: Allow
+            Action:
+            - s3:*
+            Resource: '*'
+          - Sid: AllowSNSPublish
+            Effect: Allow
+            Action:
+            - sns:*
+            Resource: !Ref SNSTopic
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MissingPersonTable
+  
+  #Kinesis Data Stream
+  EventMetadataStream:
+    Type: "AWS::Kinesis::Stream"
+    Properties: 
+      Name: !Sub ${ProjectId}-Stream
+      ShardCount: 1
+
+  # SNS Publish Role, used by the kinesis video lambda to capture the events from kinesis data stream, fetch details from dynamodb and trigger SNS notification
+  SNSPublishRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub 'CodeStar-${ProjectId}-Execution${Stage}'
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
-        - Effect: Allow
-          Principal:
-            Service: [lambda.amazonaws.com]
-          Action: sts:AssumeRole
-      Path: /
-      ManagedPolicyArns:
-        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
-      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/CodeStar_${ProjectId}_PermissionsBoundary'
+          -
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        -
+          PolicyName: lambda-comprehend-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                - 'sns:Publish'
+                Resource: !Ref SNSTopic
+              - 
+                Effect: Allow
+                Action:
+                - 's3:*'
+                - 's3:Get*'
+                - 's3:List*'
+                Resource: '*'
+              -
+                Effect: Allow
+                Action:
+                - dynamodb:*
+                Resource: '*'
+              -
+                Effect: Allow
+                Action:
+                    - 'kinesis:GetRecords'
+                    - 'kinesis:GetShardIterator'
+                    - 'kinesis:DescribeStream'
+                    - 'kinesis:ListStreams'
+                Resource: !GetAtt EventMetadataStream.Arn
+              -
+                Effect: Allow
+                Action:
+                    - 'kinesis:ListStreams'
+                Resource: '*'
+              -
+                Effect: Allow
+                Action:
+                    - 'logs:*'
+                Resource: '*'
+  
+  # IAM role for stream consumer to capture frames off the kinesis video stream , send them to Rekognition and write the result to kinesis data stream
+  RekognitionVideoIAM:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service: rekognition.amazonaws.com
+            Action: sts:AssumeRole
+      Path: '/'
+      Policies:
+        -
+          PolicyName: lambda-comprehend-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                    - 'kinesis:*'
+                Resource: !GetAtt EventMetadataStream.Arn
+              -
+                Effect: Allow
+                Action:
+                    - 'kinesisvideo:*'
+                Resource: '*'
+              -
+                Effect: Allow
+                Action:
+                    - 'rekognition:*'
+                Resource: '*'
+  
+  # Lambda function to process the kinesis data stream events
+  RekognitionVideoLambda: 
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          SnsTopic: !Ref SNSTopic
+          PersonData: !Ref MissingPersonTable
+      
+      Role: 
+        Fn::GetAtt:
+          - SNSPublishRole
+          - Arn
+      Code: 
+        S3Bucket: !Ref KinesisLambdaCodeBucket
+        S3Key: "lambda.zip"
+      Runtime: "python3.8"
+      Timeout: 500
+
+  RekognitionLambdaKinesisMapping:
+    Type: "AWS::Lambda::EventSourceMapping"
+    Properties: 
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt EventMetadataStream.Arn
+      FunctionName: !GetAtt  RekognitionVideoLambda.Arn
+      StartingPosition: "TRIM_HORIZON"
+
+  # SNS TOPIC For Notification
+  SNSTopic:
+    Type: "AWS::SNS::Topic"
+    Properties: 
+      DisplayName: !Sub ${ProjectId} SNS Topic
+      Subscription:
+        - 
+          Endpoint: !Sub ${EmailAddress}
+          Protocol: email
+  
+  # Dynamo DB table to save the missing person records
+  MissingPersonTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: missingpersonrecords
+      AttributeDefinitions:
+        - AttributeName: faceid
+          AttributeType: S
+      KeySchema: 
+        - AttributeName: faceid
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+Outputs:
+  # ServerlessRestApi is an implicit API created out of Events key under Serverless::Function
+  # Find out more about other implicit resources you can reference within SAM
+  # https://github.com/awslabs/serverless-application-model/blob/master/docs/internals/generated_resources.rst#api
+  Api:
+    Description: "API Gateway endpoint URL for Prod stage"
+    Value: !Sub "https://${FaceIdAPI}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/"
+  
+  KinesisDataStreamArn:
+    Description: Kinesis Data Stream Arn (used in Stream Processer Input)
+    Value: !GetAtt EventMetadataStream.Arn
+  
+  RekognitionVideoIAM:
+    Description: Rekognition Video Processing IAM Arn (used in Stream Processer Input)
+    Value: !GetAtt RekognitionVideoIAM.Arn
