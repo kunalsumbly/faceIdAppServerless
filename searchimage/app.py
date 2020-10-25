@@ -9,6 +9,7 @@ COLLECTION_ID = os.environ['REKOGNITIONCOLLECTION']
 FACE_MATCH_THRESHOLD = int(os.environ['REKOGNITIONFACEMATCHTHRESHOLD'])
 LOG_LEVEL = logging.DEBUG
 
+
 s3 = boto3.client('s3')
 sns=boto3.client('sns')
 rekognition = boto3.client('rekognition')
