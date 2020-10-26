@@ -25,7 +25,7 @@ Parameters:
   KinesisCollectionId:
     Type: String
     Description: Kinesis collection Id
-    Default: faceIdAppCollection10
+    Default: faceIdAppCollection09
   KinesisLambdaCodeBucket:
     Type: String
     Description: This bucket is to upload the lambda zip for capturing Kinesis data stream events
