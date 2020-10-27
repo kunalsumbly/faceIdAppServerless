@@ -39,6 +39,7 @@ def lambda_handler(event, context):
                     MaxFaces=1
         )
 
+
         logger.info("After Searching in rekognition")
 
         if len(response['FaceMatches']) == 0:
