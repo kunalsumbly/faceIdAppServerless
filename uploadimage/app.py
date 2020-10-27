@@ -26,6 +26,7 @@ def lambda_handler(event, context):
         missing_person_data = data['missingpersondata']
         logger.info("Indexing faces.")
         
+        
         # before we add the image to index check if the face is already registered in rekognition
         response = rekognition.search_faces_by_image(
                     Image={
